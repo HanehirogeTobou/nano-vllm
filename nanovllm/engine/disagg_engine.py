@@ -53,7 +53,7 @@ from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.sampling_params import SamplingParams
 
-_MIN_DURATION = 1e-9  # prevents division by zero in throughput calculations
+_DURATION_EPSILON = 1e-9  # prevents division by zero in throughput calculations
 
 
 # ---------------------------------------------------------------------------
@@ -329,9 +329,13 @@ class DecodeEngine:
 
         # Ensure complete transferred blocks are hashed so that
         # BlockManager.may_append's assertion passes when a new block is
-        # needed on the very first decode step (edge case: the first decode
-        # token lands at the start of a new block because all prefill tokens
-        # exactly fill an integer number of blocks).
+        # needed on the very first decode step.
+        #
+        # The tricky case: prefill fills exactly k * block_size tokens.
+        # After appending d0, len(seq) == k * block_size + 1, so
+        # may_append fires the `% block_size == 1` branch which asserts
+        # `last_block.hash != -1` before allocating the new block.
+        # We pre-hash the transferred blocks here to satisfy that assertion.
         bm = self.scheduler.block_manager
         if len(seq) % bm.block_size == 1:
             h = -1
@@ -408,13 +412,11 @@ class DecodeEngine:
         if use_tqdm:
             pbar = tqdm(total=num_seqs, desc="Decoding", dynamic_ncols=True)
         prev = 0
-        decode_throughput = 0.0
         while len(self._results) < num_seqs:
             t = perf_counter()
             finished = self.step()
             if finished and use_tqdm:
-                decode_throughput = len(finished) / max(perf_counter() - t, _MIN_DURATION)
-                pbar.set_postfix({"Decode": f"{int(decode_throughput)}tok/s"})
+                pbar.set_postfix({"Decode": f"{int(len(finished) / max(perf_counter() - t, _DURATION_EPSILON))}tok/s"})
                 curr = len(self._results)
                 pbar.update(curr - prev)
                 prev = curr
