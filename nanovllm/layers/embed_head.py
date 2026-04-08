@@ -61,7 +61,9 @@ class ParallelLMHead(VocabParallelEmbedding):
             x = x[last_indices].contiguous()
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
+            tp_group = get_tp_group()
+            dst = dist.get_global_rank(tp_group, 0) if tp_group is not None else 0
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
-            dist.gather(logits, all_logits, 0, group=get_tp_group())
+            dist.gather(logits, all_logits, dst, group=tp_group)
             logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
         return logits
