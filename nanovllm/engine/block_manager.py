@@ -93,6 +93,19 @@ class BlockManager:
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
+    def allocate_transferred(self, seq: Sequence, num_blocks: int) -> None:
+        """Allocate *num_blocks* fresh blocks for a sequence whose KV cache
+        has been transferred from a prefill instance.  Unlike :meth:`allocate`,
+        this method skips the prefix-cache lookup and always allocates new
+        (un-hashed) blocks.
+        """
+        assert not seq.block_table, "sequence already has blocks"
+        assert len(self.free_block_ids) >= num_blocks, "not enough free blocks"
+        for _ in range(num_blocks):
+            block_id = self.free_block_ids[0]
+            self._allocate_block(block_id)
+            seq.block_table.append(block_id)
+
     def may_append(self, seq: Sequence):
         block_table = seq.block_table
         last_block = self.blocks[block_table[-1]]
