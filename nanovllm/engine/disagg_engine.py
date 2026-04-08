@@ -1,41 +1,45 @@
-"""Prefill-Decode (PD) disaggregated engines for nano-vllm.
+"""PD (Prefill-Decode) disaggregation for single-machine multi-GPU setups.
 
-This module provides :class:`PrefillEngine` and :class:`DecodeEngine` that
-mirror vLLM's PD disaggregation design:
+Design
+------
+On the same machine, KV cache is transferred through a shared
+:class:`multiprocessing.Queue` instead of a TCP socket.  Both engines are
+meant to run in **separate processes** that share the queue created before
+spawning:
 
-* **PrefillEngine** handles only the prefill phase.  After each prefill batch
-  it extracts the computed KV cache blocks from GPU memory, bundles them with
-  the sequence metadata (including the first generated token), and ships
-  everything over TCP to a paired :class:`DecodeEngine`.
+    import torch.multiprocessing as mp
+    from nanovllm import PrefillEngine, DecodeEngine, SamplingParams
 
-* **DecodeEngine** listens for incoming KV transfers on a background thread.
-  Each received payload is materialised into the local GPU KV cache, and the
-  reconstructed sequence is injected directly into the decode scheduler so
-  that generation continues seamlessly.
+    def run_prefill(model, kv_queue, prompts, sampling_params):
+        engine = PrefillEngine(model, kv_queue, nccl_port=2333)
+        engine.generate(prompts, sampling_params)
 
-Typical deployment (two separate processes / machines):
+    def run_decode(model, kv_queue, num_seqs):
+        engine = DecodeEngine(model, kv_queue, nccl_port=2334)
+        return engine.decode_all(num_seqs)
 
-    # Process A – prefill
-    from nanovllm import PrefillEngine, SamplingParams
-    engine = PrefillEngine(model_path, kv_host="host_B", kv_port=29500)
-    engine.generate(prompts, SamplingParams(max_tokens=256))
-
-    # Process B – decode
-    from nanovllm import DecodeEngine, SamplingParams
-    engine = DecodeEngine(model_path, kv_host="0.0.0.0", kv_port=29500)
-    results = engine.decode_all()
+    if __name__ == "__main__":
+        ctx = mp.get_context("spawn")
+        kv_queue = ctx.Queue()
+        p = ctx.Process(target=run_decode, args=(model, kv_queue, len(prompts)))
+        p.start()
+        run_prefill(model, kv_queue, prompts, SamplingParams(max_tokens=256))
+        p.join()
 
 Notes
 -----
-* Tensor-parallel size must be identical on both instances.
-* For tensor_parallel_size > 1 the KV transfer covers only rank-0's shard;
-  cross-rank synchronisation during transfer is not yet supported.
+* Use different ``nccl_port`` values for prefill and decode so their internal
+  NCCL process groups do not conflict on the same machine.
+* Tensor-parallel size must be identical on both sides.
+* KV tensors are moved to CPU before being placed in the queue; they are
+  moved back to the decode GPU inside :meth:`DecodeEngine._inject_sequence`.
 """
 
 from __future__ import annotations
 
 import atexit
-from dataclasses import fields
+import queue as _queue
+from dataclasses import dataclass, fields
 from time import perf_counter
 
 import torch
@@ -44,7 +48,6 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 from nanovllm.config import Config
-from nanovllm.engine.kv_transfer import KVReceiver, KVSender, KVTransferMeta
 from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.sequence import Sequence, SequenceStatus
@@ -54,10 +57,27 @@ _MIN_DURATION = 1e-9  # prevents division by zero in throughput calculations
 
 
 # ---------------------------------------------------------------------------
+# KV transfer payload (replaces KVTransferMeta + TCP framing)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _KVPayload:
+    seq_id: int
+    token_ids: list
+    num_prompt_tokens: int
+    temperature: float
+    max_tokens: int
+    ignore_eos: bool
+
+
+# ---------------------------------------------------------------------------
 # Shared helper: build Config + spawn TP workers + create rank-0 ModelRunner
 # ---------------------------------------------------------------------------
 
-def _build_engine(model: str, kwargs: dict) -> tuple[Config, ModelRunner, list, AutoTokenizer, Scheduler]:
+def _build_engine(
+    model: str,
+    kwargs: dict,
+) -> tuple[Config, ModelRunner, list, AutoTokenizer, Scheduler]:
     config_fields = {field.name for field in fields(Config)}
     config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
     config = Config(model, **config_kwargs)
@@ -84,24 +104,33 @@ def _build_engine(model: str, kwargs: dict) -> tuple[Config, ModelRunner, list, 
 # ---------------------------------------------------------------------------
 
 class PrefillEngine:
-    """Prefill-only engine.
+    """Prefill-only engine for single-machine PD disaggregation.
 
-    Runs the prefill step, then ships the resulting KV cache blocks and
-    sequence metadata (including the first generated token) to the paired
-    :class:`DecodeEngine` via :class:`~nanovllm.engine.kv_transfer.KVSender`.
+    Runs the prefill step, samples the first token, then places the KV cache
+    blocks together with sequence metadata into *kv_queue* for the paired
+    :class:`DecodeEngine` to consume.
+
+    Parameters
+    ----------
+    model:
+        Path to the model directory.
+    kv_queue:
+        A :class:`multiprocessing.Queue` shared with the decode process.
+        Create it with ``mp.get_context("spawn").Queue()`` before spawning
+        either process.
+    **kwargs:
+        Forwarded to :class:`~nanovllm.config.Config`
+        (e.g. ``tensor_parallel_size``, ``nccl_port``, ``max_model_len``).
     """
 
-    def __init__(self, model: str, kv_host: str, kv_port: int, **kwargs) -> None:
+    def __init__(self, model: str, kv_queue: mp.Queue, **kwargs) -> None:
         config, model_runner, ps, tokenizer, scheduler = _build_engine(model, kwargs)
         self.config = config
         self.model_runner = model_runner
         self.ps = ps
         self.tokenizer = tokenizer
         self.scheduler = scheduler
-
-        self.kv_sender = KVSender(kv_host, kv_port)
-        self.kv_sender.connect()
-
+        self.kv_queue = kv_queue
         atexit.register(self._exit)
 
     def _exit(self) -> None:
@@ -109,7 +138,6 @@ class PrefillEngine:
         del self.model_runner
         for p in self.ps:
             p.join()
-        self.kv_sender.close()
 
     # ------------------------------------------------------------------
     # Public API
@@ -120,7 +148,7 @@ class PrefillEngine:
         prompt: str | list[int],
         sampling_params: SamplingParams,
     ) -> int:
-        """Add a generation request and return its assigned sequence id."""
+        """Enqueue a generation request and return its sequence id."""
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
@@ -128,17 +156,17 @@ class PrefillEngine:
         return seq.seq_id
 
     def step(self) -> int:
-        """Schedule and run one prefill batch.
+        """Run one prefill batch and transfer resulting KV caches to decode.
 
         For each sequence in the batch:
 
         1. Run the prefill forward pass and sample the first token.
-        2. Extract the KV cache blocks for that sequence from GPU memory.
-        3. Send ``(sequence metadata + KV data)`` to the decode engine.
-        4. Deallocate the blocks on the prefill side so they can be reused.
+        2. Extract the KV blocks from GPU memory (as a CPU tensor).
+        3. Put ``(_KVPayload, kv_tensor)`` into *kv_queue*.
+        4. Deallocate the blocks on the prefill side.
 
         Returns:
-            Number of sequences whose KV cache was transferred.
+            Number of sequences transferred in this step.
         """
         if not self.scheduler.waiting:
             return 0
@@ -149,25 +177,23 @@ class PrefillEngine:
         token_ids = self.model_runner.call("run", seqs, True)
 
         for seq, token_id in zip(seqs, token_ids):
-            # Extract KV cache for this sequence's allocated blocks.
-            # Shape: [2, num_layers, num_kv_blocks, block_size, kv_heads, head_dim]
+            # Copy KV blocks to CPU *before* appending the first decode token
+            # so the tensor shape matches the allocated block_table.
             kv_data = self.model_runner.kv_cache[:, :, seq.block_table].cpu()
 
-            # Append the first generated token so the decode side has the
-            # complete token_ids = [prompt…, first_decode_token].
             seq.append_token(token_id)
 
-            self.kv_sender.send(
+            payload = _KVPayload(
                 seq_id=seq.seq_id,
-                token_ids=seq.token_ids,
+                token_ids=list(seq.token_ids),
                 num_prompt_tokens=seq.num_prompt_tokens,
                 temperature=seq.temperature,
                 max_tokens=seq.max_tokens,
                 ignore_eos=seq.ignore_eos,
-                kv_data=kv_data,
             )
+            self.kv_queue.put((payload, kv_data))
 
-            # Release the KV blocks on the prefill side.
+            # Release blocks so they can be reused for subsequent prefills.
             self.scheduler.block_manager.deallocate(seq)
             seq.status = SequenceStatus.FINISHED
             self.scheduler.running.remove(seq)
@@ -183,7 +209,7 @@ class PrefillEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> int:
-        """Prefill all *prompts* and transfer KV caches to the decode engine.
+        """Prefill all *prompts* and send KV caches to the decode engine.
 
         Returns:
             Total number of sequences transferred.
@@ -203,6 +229,8 @@ class PrefillEngine:
                 pbar.update(n)
         if use_tqdm:
             pbar.close()
+        # Signal to the decode engine that no more sequences are coming.
+        self.kv_queue.put(None)
         return total
 
 
@@ -211,27 +239,35 @@ class PrefillEngine:
 # ---------------------------------------------------------------------------
 
 class DecodeEngine:
-    """Decode-only engine.
+    """Decode-only engine for single-machine PD disaggregation.
 
-    A :class:`~nanovllm.engine.kv_transfer.KVReceiver` runs in a background
-    thread.  On each :meth:`step` call the engine drains the receiver queue,
-    injects the transferred sequences into the running set of the scheduler,
-    and executes one decode iteration.
+    Reads ``(_KVPayload, kv_tensor)`` pairs from *kv_queue*, materialises the
+    KV data into the local GPU cache, and runs decode iterations until all
+    sequences finish.
+
+    Parameters
+    ----------
+    model:
+        Path to the model directory.
+    kv_queue:
+        The same :class:`multiprocessing.Queue` passed to :class:`PrefillEngine`.
+    **kwargs:
+        Forwarded to :class:`~nanovllm.config.Config`.
+        Use a different ``nccl_port`` than the prefill engine to avoid port
+        conflicts (e.g. ``nccl_port=2334``).
     """
 
-    def __init__(self, model: str, kv_host: str, kv_port: int, **kwargs) -> None:
+    def __init__(self, model: str, kv_queue: mp.Queue, **kwargs) -> None:
         config, model_runner, ps, tokenizer, scheduler = _build_engine(model, kwargs)
         self.config = config
         self.model_runner = model_runner
         self.ps = ps
         self.tokenizer = tokenizer
         self.scheduler = scheduler
+        self.kv_queue = kv_queue
 
-        self.kv_receiver = KVReceiver(kv_host, kv_port)
-        self.kv_receiver.start()
-
-        # seq_id → completion token ids for finished sequences
         self._results: dict[int, list[int]] = {}
+        self._prefill_done = False
 
         atexit.register(self._exit)
 
@@ -240,55 +276,70 @@ class DecodeEngine:
         del self.model_runner
         for p in self.ps:
             p.join()
-        self.kv_receiver.stop()
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _inject_pending(self) -> None:
-        """Drain the KV receiver queue and inject sequences into the scheduler."""
-        while not self.kv_receiver.queue.empty():
-            meta, kv_data = self.kv_receiver.queue.get_nowait()
-            self._inject_sequence(meta, kv_data)
+    def _drain_queue(self, block: bool = False, timeout: float = 0.05) -> None:
+        """Pull all available items from *kv_queue* and inject them.
 
-    def _inject_sequence(self, meta: KVTransferMeta, kv_data: torch.Tensor) -> None:
-        """Reconstruct a :class:`Sequence` from transferred data.
+        When *block* is True the call waits up to *timeout* seconds for the
+        first item before returning.
+        """
+        first = True
+        while True:
+            try:
+                item = self.kv_queue.get(block=(block and first), timeout=timeout)
+                first = False
+                if item is None:
+                    self._prefill_done = True
+                else:
+                    self._inject_sequence(*item)
+            except _queue.Empty:
+                break
 
-        The KV data (covering the prefill tokens) is loaded into the local GPU
-        cache, and the sequence is added to the decode scheduler's running
-        queue so that generation can continue immediately.
+    def _inject_sequence(self, payload: _KVPayload, kv_data: torch.Tensor) -> None:
+        """Reconstruct a :class:`Sequence` from a transferred payload.
 
-        Block layout after injection
-        ----------------------------
-        * ``num_kv_blocks`` blocks are allocated for the prefill KV (positions
-          0 .. num_prompt_tokens − 1).
-        * The scheduler's ``may_append`` will allocate an extra block if the
-          first decode step requires writing to a new block (i.e. when
-          ``num_tokens % block_size == 1``).
+        The KV data is loaded into the local GPU cache, and the sequence is
+        added to the running queue so that decode can begin immediately.
         """
         num_kv_blocks: int = kv_data.shape[2]
 
-        # Build the Sequence without calling __init__ so that we can assign
-        # the prefill-side seq_id directly (bypassing the global counter).
+        # Reconstruct the Sequence without __init__ so we can reuse the
+        # prefill-side seq_id directly (bypassing the global counter).
         seq = object.__new__(Sequence)
-        seq.seq_id = meta.seq_id
+        seq.seq_id = payload.seq_id
         seq.status = SequenceStatus.RUNNING
-        seq.token_ids = list(meta.token_ids)
-        seq.last_token = meta.token_ids[-1]
-        seq.num_tokens = len(meta.token_ids)
-        seq.num_prompt_tokens = meta.num_prompt_tokens
+        seq.token_ids = list(payload.token_ids)
+        seq.last_token = payload.token_ids[-1]
+        seq.num_tokens = len(payload.token_ids)
+        seq.num_prompt_tokens = payload.num_prompt_tokens
         seq.num_cached_tokens = 0
         seq.block_table = []
-        seq.temperature = meta.temperature
-        seq.max_tokens = meta.max_tokens
-        seq.ignore_eos = meta.ignore_eos
+        seq.temperature = payload.temperature
+        seq.max_tokens = payload.max_tokens
+        seq.ignore_eos = payload.ignore_eos
 
-        # Allocate fresh blocks and load the received KV data into the cache.
         self.scheduler.block_manager.allocate_transferred(seq, num_kv_blocks)
         self.model_runner.kv_cache[:, :, seq.block_table] = kv_data.to(
             self.model_runner.kv_cache.device
         )
+
+        # Ensure complete transferred blocks are hashed so that
+        # BlockManager.may_append's assertion passes when a new block is
+        # needed on the very first decode step (edge case: the first decode
+        # token lands at the start of a new block because all prefill tokens
+        # exactly fill an integer number of blocks).
+        bm = self.scheduler.block_manager
+        if len(seq) % bm.block_size == 1:
+            h = -1
+            for i, block_id in enumerate(seq.block_table):
+                toks = list(seq.block(i))
+                h = bm.compute_hash(toks, h)
+                bm.blocks[block_id].update(h, toks)
+                bm.hash_to_block_id[h] = block_id
 
         self.scheduler.running.append(seq)
 
@@ -297,13 +348,22 @@ class DecodeEngine:
     # ------------------------------------------------------------------
 
     def step(self) -> list[tuple[int, list[int]]]:
-        """Inject pending transfers, then run one decode iteration.
+        """Inject pending transfers and run one decode iteration.
+
+        If the running queue is empty the call blocks briefly waiting for
+        new transfers from the prefill engine.
 
         Returns:
             List of ``(seq_id, completion_token_ids)`` for sequences that
             finished during this step.
         """
-        self._inject_pending()
+        if not self.scheduler.running:
+            # Block until at least one sequence arrives (or prefill signals done).
+            self._drain_queue(block=True)
+        else:
+            # Non-blocking drain: pick up any additional ready sequences.
+            self._drain_queue(block=False)
+
         if not self.scheduler.running:
             return []
 
@@ -324,32 +384,44 @@ class DecodeEngine:
         return finished
 
     def has_pending(self) -> bool:
-        """Return True while there are running sequences or queued transfers."""
-        return bool(self.scheduler.running) or not self.kv_receiver.queue.empty()
+        """Return True while there are running sequences or unseen transfers."""
+        return bool(self.scheduler.running) or not (
+            self._prefill_done and self.kv_queue.empty()
+        )
 
     def get_result(self, seq_id: int) -> list[int] | None:
         """Return completion token ids for *seq_id*, or ``None`` if not done."""
         return self._results.get(seq_id)
 
-    def decode_all(self, use_tqdm: bool = True) -> dict[int, str]:
-        """Run the decode loop until all pending sequences are finished.
+    def decode_all(self, num_seqs: int, use_tqdm: bool = True) -> dict[int, str]:
+        """Run the decode loop until *num_seqs* sequences are finished.
+
+        Parameters
+        ----------
+        num_seqs:
+            Total number of sequences submitted to the prefill engine.
+            The loop exits once this many results have been collected.
 
         Returns:
             Mapping ``{seq_id: decoded_text}`` for every finished sequence.
         """
         if use_tqdm:
-            pbar = tqdm(desc="Decoding", dynamic_ncols=True)
+            pbar = tqdm(total=num_seqs, desc="Decoding", dynamic_ncols=True)
+        prev = 0
         decode_throughput = 0.0
-        while self.has_pending():
+        while len(self._results) < num_seqs:
             t = perf_counter()
             finished = self.step()
             if finished and use_tqdm:
                 decode_throughput = len(finished) / max(perf_counter() - t, _MIN_DURATION)
                 pbar.set_postfix({"Decode": f"{int(decode_throughput)}tok/s"})
-                pbar.update(len(finished))
+                curr = len(self._results)
+                pbar.update(curr - prev)
+                prev = curr
         if use_tqdm:
             pbar.close()
         return {
             sid: self.tokenizer.decode(tids)
             for sid, tids in self._results.items()
         }
+
