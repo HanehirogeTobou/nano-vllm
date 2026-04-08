@@ -42,6 +42,7 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
+        Sequence.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
         self.rank_type = rank_type
         self.global_rank = rank

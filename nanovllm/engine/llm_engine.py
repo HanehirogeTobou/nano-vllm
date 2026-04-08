@@ -93,6 +93,7 @@ class LLMEngine:
 
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
+        self._exited = False
         atexit.register(self.exit)
 
     # ------------------------------------------------------------------
@@ -172,6 +173,9 @@ class LLMEngine:
     # ------------------------------------------------------------------
 
     def exit(self):
+        if self._exited:
+            return
+        self._exited = True
         if self.config.enable_pd_separation:
             self.decode_in_queue.put(("exit",))
             self.model_runner.call("exit")
@@ -202,6 +206,8 @@ class LLMEngine:
 
     def _step_normal(self):
         seqs, is_prefill = self.scheduler.schedule()
+        if not seqs:
+            return [], 0
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
