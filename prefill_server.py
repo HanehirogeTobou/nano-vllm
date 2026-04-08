@@ -92,11 +92,7 @@ class PrefillHandler(BaseHTTPRequestHandler):
         )
 
         with PrefillHandler._lock:
-            # Assign seq_id *before* scheduling so the caller can poll.
-            self.engine.add_request(prompt, sp)
-            # step() returns the number of sequences transferred; peek at the
-            # latest seq_id that was just created (it is the last one added).
-            seq_id = self.engine.scheduler.waiting[-1].seq_id
+            seq_id = self.engine.add_request(prompt, sp)
             self.engine.step()
 
         self._send_json(200, {"seq_id": seq_id})

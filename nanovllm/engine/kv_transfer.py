@@ -23,6 +23,7 @@ import queue as _queue
 import socket
 import struct
 import threading
+import time
 from dataclasses import dataclass
 
 import torch
@@ -101,7 +102,6 @@ class KVSender:
 
     def connect(self, timeout: float = 60.0) -> None:
         """Connect to the KVReceiver, retrying until *timeout* seconds."""
-        import time
         deadline = time.monotonic() + timeout
         while True:
             try:
@@ -129,7 +129,12 @@ class KVSender:
         Args:
             kv_data: shape ``[2, num_layers, num_kv_blocks, block_size,
                                num_kv_heads, head_dim]``
+
+        Raises:
+            RuntimeError: if :meth:`connect` has not been called yet.
         """
+        if self._sock is None:
+            raise RuntimeError("KVSender.connect() must be called before send()")
         kv_bytes = _tensor_to_bytes(kv_data)
         meta = KVTransferMeta(
             seq_id=seq_id,
@@ -188,6 +193,8 @@ class KVReceiver:
         t.start()
 
     def _accept_loop(self) -> None:
+        if self._server_sock is None:
+            return
         while self._running:
             try:
                 conn, _ = self._server_sock.accept()

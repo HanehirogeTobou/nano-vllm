@@ -50,6 +50,8 @@ from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.sampling_params import SamplingParams
 
+_MIN_DURATION = 1e-9  # prevents division by zero in throughput calculations
+
 
 # ---------------------------------------------------------------------------
 # Shared helper: build Config + spawn TP workers + create rank-0 ModelRunner
@@ -117,11 +119,13 @@ class PrefillEngine:
         self,
         prompt: str | list[int],
         sampling_params: SamplingParams,
-    ) -> None:
+    ) -> int:
+        """Add a generation request and return its assigned sequence id."""
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
+        return seq.seq_id
 
     def step(self) -> int:
         """Schedule and run one prefill batch.
@@ -340,7 +344,7 @@ class DecodeEngine:
             t = perf_counter()
             finished = self.step()
             if finished and use_tqdm:
-                decode_throughput = len(finished) / max(perf_counter() - t, 1e-9)
+                decode_throughput = len(finished) / max(perf_counter() - t, _MIN_DURATION)
                 pbar.set_postfix({"Decode": f"{int(decode_throughput)}tok/s"})
                 pbar.update(len(finished))
         if use_tqdm:
