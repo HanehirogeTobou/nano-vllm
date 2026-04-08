@@ -10,21 +10,90 @@ from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.utils.tp_context import set_tp_group
 
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(
+        self,
+        config: Config,
+        rank: int,
+        event: Event | list[Event],
+        rank_type: str = "normal",
+    ):
+        """Initialise a model runner process.
+
+        Parameters
+        ----------
+        config:
+            Engine configuration.
+        rank:
+            *Global* rank of this process across all prefill + decode ranks.
+        event:
+            A single ``Event`` (for worker processes) or a list of events
+            (for the master, one per worker) used to signal shared-memory
+            commands.
+        rank_type:
+            ``"normal"``  – legacy single-group mode (no PD separation).
+            ``"prefill"`` – member of the prefill group.
+            ``"decode"``  – member of the decode group.
+        """
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
-        self.world_size = config.tensor_parallel_size
-        self.rank = rank
+        self.rank_type = rank_type
+        self.global_rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
-        torch.cuda.set_device(rank)
+        if config.enable_pd_separation:
+            P = config.num_prefill_ranks
+            D = config.num_decode_ranks
+            total = P + D  # == config.tensor_parallel_size
+
+            # All ranks join the global group (used for point-to-point KV transfer)
+            dist.init_process_group(
+                "nccl", "tcp://localhost:2333",
+                world_size=total, rank=rank,
+            )
+            torch.cuda.set_device(rank)
+
+            # Create TP sub-groups (every rank creates both; only members use theirs)
+            prefill_pg = dist.new_group(list(range(P)))
+            decode_pg = dist.new_group(list(range(P, total)))
+
+            if rank_type == "prefill":
+                self.tp_group = prefill_pg
+                self.world_size = P
+                # Prefill group occupies global ranks 0 … P-1, so the local
+                # rank within the prefill group equals the global rank.
+                self.rank = rank
+                # dst for KV send: same local index in decode group (global rank P+i)
+                self.kv_peer_rank = rank + P
+            else:  # decode
+                self.tp_group = decode_pg
+                self.world_size = D
+                self.rank = rank - P  # local rank within decode group
+                # src for KV recv: same local index in prefill group
+                self.kv_peer_rank = rank - P
+
+            set_tp_group(self.tp_group)
+            shm_name = "nanovllm_prefill" if rank_type == "prefill" else "nanovllm_decode"
+        else:
+            total = config.tensor_parallel_size
+            dist.init_process_group(
+                "nccl", "tcp://localhost:2333",
+                world_size=total, rank=rank,
+            )
+            torch.cuda.set_device(rank)
+            set_tp_group(None)  # use default (global) group for all TP ops
+            self.world_size = total
+            self.rank = rank
+            self.tp_group = None
+            self.kv_peer_rank = -1
+            shm_name = "nanovllm"
+
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
@@ -39,18 +108,18 @@ class ModelRunner:
         torch.set_default_dtype(default_dtype)
 
         if self.world_size > 1:
-            if rank == 0:
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
-                dist.barrier()
+            if self.rank == 0:
+                self.shm = SharedMemory(name=shm_name, create=True, size=2**20)
+                dist.barrier(group=self.tp_group)
             else:
-                dist.barrier()
-                self.shm = SharedMemory(name="nanovllm")
+                dist.barrier(group=self.tp_group)
+                self.shm = SharedMemory(name=shm_name)
                 self.loop()
 
     def exit(self):
         if self.world_size > 1:
             self.shm.close()
-            dist.barrier()
+            dist.barrier(group=self.tp_group)
             if self.rank == 0:
                 self.shm.unlink()
         if not self.enforce_eager:
@@ -212,6 +281,28 @@ class ModelRunner:
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
+
+    def send_kv(self, block_ids: list[int]) -> None:
+        """Send the KV-cache blocks for *block_ids* to the paired decode rank.
+
+        This is a point-to-point NCCL send on the **global** process group
+        (not the TP subgroup).  The paired decode rank has the same local
+        index: prefill rank ``i`` → decode global rank ``P + i``.
+
+        Must be called via :meth:`call` so that TP worker ranks also
+        participate (each worker sends its own KV shard to its decode peer).
+        """
+        from nanovllm.engine.pd_communication import send_kv_blocks
+        send_kv_blocks(self.kv_cache, block_ids, self.kv_peer_rank)
+
+    def receive_kv(self, block_ids: list[int]) -> None:
+        """Receive KV-cache blocks from the paired prefill rank.
+
+        Mirror of :meth:`send_kv`.  Must be called via :meth:`call` so
+        that all decode TP worker ranks also receive their shard.
+        """
+        from nanovllm.engine.pd_communication import recv_kv_blocks
+        recv_kv_blocks(self.kv_cache, block_ids, self.kv_peer_rank)
 
     @torch.inference_mode()
     def capture_cudagraph(self):
